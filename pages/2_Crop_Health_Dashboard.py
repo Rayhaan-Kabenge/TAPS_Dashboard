@@ -63,11 +63,11 @@ st.markdown("""
 # ============================================================
 # CONFIGURATION
 # ============================================================
-DEFAULT_IMAGE_DIR = "/Files/Index"
-DEFAULT_SHP_PATH = "/Files/2024_Colby_TAPS_Harvest_Area.shp"
-DEFAULT_MGMT_XLSX = "/Files/Nitrogen_24.xlsx"
+DEFAULT_IMAGE_DIR = "Files/Index"
+DEFAULT_SHP_PATH = "Files/2024_Colby_TAPS_Harvest_Area.shp"
+DEFAULT_MGMT_XLSX = "Files/Nitrogen_24.xlsx"
 DEFAULT_MGMT_N_SHEET = "Sheet1"
-GHG_FILE_PATH = "/Files/GHG_2024.xlsx"
+GHG_FILE_PATH = "Files/GHG_2024.xlsx"
 
 # OpenAI API Key
 OPENAI_API_KEY = st.secrets["open_ai_key"]
