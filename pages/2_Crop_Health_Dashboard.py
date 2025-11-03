@@ -70,8 +70,7 @@ DEFAULT_MGMT_N_SHEET = "Sheet1"
 GHG_FILE_PATH = "/Users/rayhaankabenge/Desktop/KSUTAPS/2025/Dashboard_v2/Data_Source/GHG_2024.xlsx"
 
 # OpenAI API Key
-OPENAI_API_KEY = "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"
-
+OPENAI_API_KEY = st.secrets["open_ai_key"]
 # Index ranges
 NDVI_MIN, NDVI_MAX = -0.2, 1.0
 MCARI_MIN, MCARI_MAX = 0.0, 1.0
