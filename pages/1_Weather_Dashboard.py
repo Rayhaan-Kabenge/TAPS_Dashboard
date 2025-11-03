@@ -84,7 +84,7 @@ details[data-testid="stExpander"] summary { font-weight:600; }
 # =========================
 # CONFIGURATION
 # =========================
-FILE_PATH = "/Users/rayhaankabenge/Desktop/KSUTAPS/2025/ET_analysis/Data/ET_analysis_Data1.xlsx"
+FILE_PATH = "/Files/ET_analysis_Data1.xlsx"
 SHEET_NAME = "Climate_Data"
 STATION_ID = "Colby, KS"
 ELEVATION_M = 965.0

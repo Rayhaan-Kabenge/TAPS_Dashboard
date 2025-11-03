@@ -63,11 +63,11 @@ st.markdown("""
 # ============================================================
 # CONFIGURATION
 # ============================================================
-DEFAULT_IMAGE_DIR = "/Users/rayhaankabenge/Downloads/KSU/K/KSU/KSU_TAPS/TAPS_Hackathon/Data/Unzipped data/OneDrive_2024-10-24_CeresImaging/Ceres Imaging/Index"
-DEFAULT_SHP_PATH = "/Users/rayhaankabenge/Downloads/KSU/K/KSU/KSU_TAPS/TAPS_Hackathon/Data/Unzipped data/OneDrive_2024-10-24_PlotBoundaries/Plot boundaries/Map with all plots/2024_Colby_TAPS_Harvest_Area.shp"
-DEFAULT_MGMT_XLSX = "/Users/rayhaankabenge/Desktop/KSUTAPS/2025/Dashboard_v2/Data_Source/Nitrogen_24.xlsx"
+DEFAULT_IMAGE_DIR = "/Files/Index"
+DEFAULT_SHP_PATH = "/Files/2024_Colby_TAPS_Harvest_Area.shp"
+DEFAULT_MGMT_XLSX = "/Files/Nitrogen_24.xlsx"
 DEFAULT_MGMT_N_SHEET = "Sheet1"
-GHG_FILE_PATH = "/Users/rayhaankabenge/Desktop/KSUTAPS/2025/Dashboard_v2/Data_Source/GHG_2024.xlsx"
+GHG_FILE_PATH = "/Files/GHG_2024.xlsx"
 
 # OpenAI API Key
 OPENAI_API_KEY = st.secrets["open_ai_key"]
