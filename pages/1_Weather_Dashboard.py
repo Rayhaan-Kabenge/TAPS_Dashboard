@@ -36,8 +36,12 @@ def _json_default(o):
 # =========================
 # API KEYS (Replace before deployment!)
 # =========================
-API_KEY = "e16dcf4234891fcdff8016923000d310"
-OPENAI_API_KEY = "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"
+# API_KEY = "e16dcf4234891fcdff8016923000d310"
+# OPENAI_API_KEY = "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"
+
+# secrets
+API_KEY = st.secrets["open_weather_map"]
+OPENAI_API_KEY = st.secrets["open_ai_key"]
 OPENAI_MODELS_TRY = ["gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
 
 # =========================
