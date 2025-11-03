@@ -63,6 +63,7 @@ st.markdown("""
 # ============================================================
 # CONFIGURATION
 # ============================================================
+#
 DEFAULT_IMAGE_DIR = "Files/Index"
 DEFAULT_SHP_PATH = "Files/2024_Colby_TAPS_Harvest_Area.shp"
 DEFAULT_MGMT_XLSX = "Files/Nitrogen_24.xlsx"
