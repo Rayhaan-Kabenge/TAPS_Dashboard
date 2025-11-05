@@ -6,7 +6,7 @@ These functions are called by the OpenAI assistant via function calling.
 """
 
 from __future__ import annotations
-
+import scipy
 import numpy as np
 import pandas as pd
 from datetime import timedelta
