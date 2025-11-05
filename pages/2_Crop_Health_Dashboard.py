@@ -92,6 +92,7 @@ DEFAULT_MGMT_XLSX = "Files/Nitrogen_24.xlsx"
 DEFAULT_MGMT_N_SHEET = "Sheet1"
 GHG_FILE_PATH = "Files/GHG_2024.xlsx"
 
+
 # --- OpenAI client init (secure) ---
 OPENAI_API_KEY = st.secrets["open_ai_key"]
 
