@@ -38,7 +38,7 @@ from typing import Optional, Union, Dict, Any
 # ============================================================
 # PAGE CONFIG & THEME
 # ============================================================
-st.set_page_config(page_title="AI-Enhanced Crop Dashboard", layout="wide")
+st.set_page_config(page_title="Crop Module", layout="wide")
 
 st.markdown("""
 <style>
