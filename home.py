@@ -94,7 +94,7 @@ p, .markdown-text { line-height:1.45; }
 col_logo, col_title = st.columns([0.14, 1], gap="small")
 with col_logo:
     # Swap with your actual logo path if different
-    st.image("Files/ksu_logo.png", caption=None, width=320)
+    st.image("Files/ksu_logo.png", caption=None, width=520)
 with col_title:
     st.title("KSUTAPS Decision Support Suite")
     st.markdown("Weather, Crop Health, and Soil insights—unified for faster, better decisions.")
@@ -135,7 +135,7 @@ with c2:
 
 with c3:
     st.markdown('<div class="ksu-card">', unsafe_allow_html=True)
-    st.markdown("### 🌍 Soil Dashboard")
+    st.markdown("### 🌍 Soil Module")
     st.markdown("_Root-zone moisture, EC, and temperature monitoring — coming soon._")
     st.button("Preview Soil Dashboard", key="soil", use_container_width=True, disabled=True, help="This module is in development.")
     st.markdown('</div>', unsafe_allow_html=True)
