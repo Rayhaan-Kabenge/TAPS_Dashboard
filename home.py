@@ -94,7 +94,7 @@ p, .markdown-text { line-height:1.45; }
 col_logo, col_title = st.columns([0.14, 1], gap="small")
 with col_logo:
     # Swap with your actual logo path if different
-    st.image("Files/ksu_logo.png", caption=None, width=120)
+    st.image("Files/ksu_logo.png", caption=None, width=320)
 with col_title:
     st.title("KSUTAPS Decision Support Suite")
     st.markdown("Weather, Crop Health, and Soil insights—unified for faster, better decisions.")
@@ -119,7 +119,7 @@ c1, c2, c3 = st.columns(3, gap="large")
 
 with c1:
     st.markdown('<div class="ksu-card">', unsafe_allow_html=True)
-    st.markdown("### ☁️ Weather Dashboard")
+    st.markdown("### ☁️ Weather Module")
     st.markdown("Real-time weather, reference ET, and short-term forecast summaries to guide irrigation decisions.")
     if st.button("Open Weather Dashboard", key="weather", use_container_width=True, type="primary"):
         st.switch_page("pages/1_Weather_Dashboard.py")
@@ -127,7 +127,7 @@ with c1:
 
 with c2:
     st.markdown('<div class="ksu-card">', unsafe_allow_html=True)
-    st.markdown("### 🌱 Crop Health Dashboard")
+    st.markdown("### 🌱 Crop Module")
     st.markdown("Compare NDVI/MCARI2 across plots and dates, with nitrogen/irrigation overlays for context.")
     if st.button("Open Crop Health Dashboard", key="crop", use_container_width=True, type="primary"):
         st.switch_page("pages/2_Crop_Health_Dashboard.py")
