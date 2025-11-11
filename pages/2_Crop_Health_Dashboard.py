@@ -1036,7 +1036,7 @@ When answering questions:
         with st.spinner("🤖 Analyzing data..."):
             try:
                 response = client.chat.completions.create(
-                    model="gpt-4o",
+                    model="gpt-5-chat-latest",
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
@@ -1085,7 +1085,7 @@ When answering questions:
 
                     # Next turn after tools
                     response = client.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-5-chat-latest",
                         messages=messages,
                         tools=tools,
                         tool_choice="auto",
