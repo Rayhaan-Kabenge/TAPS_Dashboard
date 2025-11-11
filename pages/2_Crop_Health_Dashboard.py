@@ -1029,7 +1029,7 @@ When answering questions:
 
         history = _sanitize_history(st.session_state.ai_messages)
         messages = [{"role": "system", "content": system_message}, *history]
-
+#
         # ---------------
         # Chat completion
         # ---------------
