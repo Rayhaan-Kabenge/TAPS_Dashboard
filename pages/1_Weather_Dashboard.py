@@ -3,34 +3,42 @@
 # KSUTAPS • Complete Weather Dashboard + AI (Original + Enhancements)
 # Preserves ALL original features + adds decision support, alerts, caching
 # ---------------------------------------------------
-import os, io, json, math, base64, textwrap
+import os
+import json
 import datetime as dt
+from typing import Any, Dict
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 
-
-def _json_default(o):
-    import numpy as np
-    import pandas as pd
-    import datetime as dt
-
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        return float(o)
-    if isinstance(o, (np.bool_,)):
-        return bool(o)
-    if isinstance(o, (pd.Timestamp, dt.datetime, dt.date)):
-        return o.isoformat()
-    if o is pd.NaT:
-        return None
-    # Last resort: string
-    return str(o)
+from src.data_loader import load_climate, load_climate_with_et
+from src.plotting import (
+    et_reference_figure,
+    gdd_cumulative_line,
+    gdd_daily_bar,
+    forecast_daily_temp_band,
+    rainfall_bar_chart,
+    temperature_calendar_heatmap,
+    water_balance_figure,
+    weather_trend_figure,
+)
+from src.utils import download_button_for_figure, json_default
+from src.weather_calcs import (
+    agg_df,
+    cached_request,
+    calculate_irrigation_decision,
+    compute_et,
+    compute_gdd_columns,
+    compute_water_balance,
+    generate_smart_alerts,
+    summarize_weather_period,
+    temperature_calendar,
+)
+from src import weather_tools
 
 
 # =========================
@@ -85,9 +93,9 @@ details[data-testid="stExpander"] summary { font-weight:600; }
 # CONFIGURATION
 # =========================
 #
-FILE_PATH = "Files/ET_analysis_Data1.xlsx"
-SHEET_NAME = "Climate_Data"
-STATION_ID = "Colby, KS"
+DEFAULT_CLIMATE_PATH = "Files/ET_analysis_Data1.xlsx"
+DEFAULT_SHEET = "Climate_Data"
+DEFAULT_STATION = "Colby, KS"
 ELEVATION_M = 965.0
 LATITUDE_RAD = 0.688
 
@@ -103,330 +111,33 @@ COL_U2 = "U2(m s-1)"
 COL_RS = "Rs(MJ m-2)"
 COL_PCP = "Precip.(mm)"
 REQUIRED = [COL_DATE, COL_TMIN, COL_TMAX, COL_RHMIN, COL_RHMAX, COL_U2, COL_RS, COL_PCP]
+CLIMATE_NUMERIC_COLS = [COL_TMIN, COL_TMAX, COL_RHMIN, COL_RHMAX, COL_U2, COL_RS, COL_PCP]
 
 COL_GDD_STD_DAILY = "GDD (°C·d)"
 COL_GDD_FP_DAILY = "FromPlanting_GDD (°C·d)"
 COL_GDD_FP_CUM = "ΣGDD (from planting)"
 
-# =========================
-# NEW! CACHING LAYER
-# =========================
-if "weather_cache" not in st.session_state:
-    st.session_state.weather_cache = {}
-
-def cached_request(url, params, timeout=15, cache_minutes=30):
-    """Cache API requests to improve speed and reduce quota usage"""
-    cache_key = f"{url}_{json.dumps(params, sort_keys=True)}"
-    now = dt.datetime.now()
-    
-    if cache_key in st.session_state.weather_cache:
-        cached_data, timestamp = st.session_state.weather_cache[cache_key]
-        if (now - timestamp).total_seconds() < cache_minutes * 60:
-            return cached_data, "cached"
-    
-    try:
-        r = requests.get(url, params=params, timeout=timeout)
-        data = r.json()
-        st.session_state.weather_cache[cache_key] = (data, now)
-        return data, "live"
-    except Exception as e:
-        if cache_key in st.session_state.weather_cache:
-            return st.session_state.weather_cache[cache_key][0], "cached_fallback"
-        return {}, "error"
-
-# =========================
-# ET CALCULATIONS (ASCE Daily)
-# =========================
-def ascedaily(rfcrp, z, lat, doy, israd, tmax, tmin,
-              vapr=float('NaN'), tdew=float('NaN'),
-              rhmax=float('NaN'), rhmin=float('NaN'),
-              wndsp=float('NaN'), wndht=2.0):
-    """ASCE Standardized Penman-Monteith ET calculation"""
-    tavg = (tmax + tmin) / 2.0
-    patm = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26
-    psycon = 0.000665 * patm
-    Udelta = 2503.0 * math.exp(17.27 * tavg / (tavg + 237.3))
-    Udelta = Udelta / ((tavg + 237.3) ** 2.0)
-    emax = 0.6108 * math.exp((17.27 * tmax) / (tmax + 237.3))
-    emin = 0.6108 * math.exp((17.27 * tmin) / (tmin + 237.3))
-    es = (emax + emin) / 2.0
-    if not math.isnan(vapr):
-        ea = vapr
-    elif not math.isnan(tdew):
-        ea = 0.6108 * math.exp((17.27 * tdew) / (tdew + 237.3))
-    elif not math.isnan(rhmax) and not math.isnan(rhmin):
-        ea = (emin * rhmax / 100. + emax * rhmin / 100.) / 2.0
-    elif not math.isnan(rhmax):
-        ea = emin * rhmax / 100.
-    elif not math.isnan(rhmin):
-        ea = emax * rhmin / 100.
-    else:
-        tdew = tmin - 2.0
-        ea = 0.6108 * math.exp((17.27 * tdew) / (tdew + 237.3))
-    albedo = 0.23
-    rns = (1.0 - albedo) * israd
-    latrad = lat * math.pi / 180.0
-    dr = 1.0 + 0.033 * math.cos(2.0 * math.pi / 365.0 * doy)
-    ldelta = 0.409 * math.sin(2.0 * math.pi / 365.0 * doy - 1.39)
-    ws = math.acos(-1.0 * math.tan(latrad) * math.tan(ldelta))
-    ra1 = ws * math.sin(latrad) * math.sin(ldelta)
-    ra2 = math.cos(latrad) * math.cos(ldelta) * math.sin(ws)
-    ra = 24.0 / math.pi * 4.92 * dr * (ra1 + ra2)
-    rso = (0.75 + 2e-5 * z) * ra
-    ratio = sorted([0.3, (israd / rso if rso != 0 else 0), 1.0])[1]
-    fcd = sorted([0.05, 1.35 * ratio - 0.35, 1.0])[1]
-    tk4 = ((tmax + 273.16) ** 4.0 + (tmin + 273.16) ** 4.0) / 2.0
-    rnl = 4.901e-9 * fcd * (0.34 - 0.14 * math.sqrt(ea)) * tk4
-    rn = rns - rnl
-    g = 0.0
-    if math.isnan(wndsp): wndsp = 2.0
-    u2 = wndsp * (4.87 / math.log(67.8 * wndht - 5.42))
-    if rfcrp == 'S':
-        Cn, Cd = 900.0, 0.34
-    else:
-        Cn, Cd = 1600.0, 0.38
-    etsz = 0.408 * Udelta * (rn - g) + psycon * (Cn / (tavg + 273.0)) * u2 * (es - ea)
-    etsz = etsz / (Udelta + psycon * (1.0 + Cd * u2))
-    return etsz
-
-def calculate_effective_rainfall(precip_mm, method="usda"):
-    """Calculate effective rainfall using USDA method"""
-    if method == "usda":
-        if precip_mm < 25:
-            return precip_mm * 0.95
-        else:
-            return 25 * 0.95 + (precip_mm - 25) * 0.75
-    return precip_mm * 0.8
-
-# =========================
-# GDD HELPERS
-# =========================
-def gdd_excel_style(tmin, tmax, tbase, tmax_cap):
-    """Calculate Growing Degree Days using standard method"""
-    tavg = (tmin + tmax) / 2.0
-    if (tmax <= tmax_cap) and (tmin >= tbase):
-        return tavg - tbase
-    elif (tmax <= tmax_cap) and (tmax >= tbase) and (tmin < tbase):
-        return ((tmax + tbase) / 2.0) - tbase
-    elif (tmax > tmax_cap) and (tmin >= tbase):
-        return ((tmax_cap + tmin) / 2.0) - tbase
-    elif (tmax > tmax_cap) and (tmin < tbase):
-        return ((tmax_cap + tbase) / 2.0) - tbase
-    else:
-        return 0.0
-
-def compute_gdd_columns(df: pd.DataFrame, tbase: float, tcap: float,
-                        planting_date: pd.Timestamp, harvest_date: pd.Timestamp | None) -> pd.DataFrame:
-    """Compute GDD columns for the entire dataset"""
-    out = df.copy()
-    std_daily, fp_daily = [], []
-    for _, r in out.iterrows():
-        g = gdd_excel_style(float(r[COL_TMIN]), float(r[COL_TMAX]), tbase, tcap)
-        std_daily.append(round(g, 3))
-        if r[COL_DATE] >= planting_date and (harvest_date is None or r[COL_DATE] <= harvest_date):
-            fp_daily.append(round(g, 3))
-        else:
-            fp_daily.append(0.0)
-    out[COL_GDD_STD_DAILY] = std_daily
-    out[COL_GDD_FP_DAILY] = fp_daily
-    out[COL_GDD_FP_CUM] = out[COL_GDD_FP_DAILY].cumsum()
-    return out
-
-# =========================
-# NEW! IRRIGATION DECISION ENGINE
-# =========================
-def calculate_irrigation_decision(recent_precip_mm, eto_mm, soil_moisture_percent=None,
-                                  growth_stage="vegetative", cost_per_inch=25.0):
-    """Decision engine for irrigation recommendations based on water balance"""
-    effective_rain = calculate_effective_rainfall(recent_precip_mm)
-    water_deficit = eto_mm - effective_rain
-    
-    stage_thresholds = {
-        "vegetative": 15,
-        "reproductive": 10,
-        "grain_fill": 12,
-        "maturity": 20
-    }
-    threshold = stage_thresholds.get(growth_stage, 15)
-    
-    irrigate = bool(water_deficit > threshold)
-
-    inches_needed = max(0, water_deficit / 25.4) if irrigate else 0
-    cost_estimate = inches_needed * cost_per_inch
-    
-    reasons = []
-    if water_deficit > threshold:
-        reasons.append(f"Water deficit ({water_deficit:.1f}mm) exceeds threshold ({threshold}mm)")
-    if effective_rain < eto_mm * 0.5:
-        reasons.append(f"Effective rainfall ({effective_rain:.1f}mm) insufficient")
-    if growth_stage in ["reproductive", "grain_fill"]:
-        reasons.append(f"Critical {growth_stage} stage")
-    
-    return {
-        "irrigate": irrigate,
-        "inches_needed": round(inches_needed, 2),
-        "cost_usd": round(cost_estimate, 2),
-        "water_deficit_mm": round(water_deficit, 1),
-        "effective_rain_mm": round(effective_rain, 1),
-        "eto_mm": round(eto_mm, 1),
-        "reasoning": reasons or ["Sufficient moisture from recent rainfall"]
-    }
-
-# =========================
-# NEW! SMART ALERT SYSTEM
-# =========================
-def generate_smart_alerts(forecast_df: pd.DataFrame, current_temp: float = None) -> list:
-    """Generate actionable alerts from forecast data"""
-    alerts = []
-    if forecast_df.empty:
-        return alerts
-    
-    now = pd.Timestamp.now()
-    next_24h = forecast_df[forecast_df["Datetime"].between(now, now + pd.Timedelta(hours=24))]
-    next_48h = forecast_df[forecast_df["Datetime"].between(now, now + pd.Timedelta(hours=48))]
-    
-    if next_24h.empty:
-        return alerts
-    
-    # Frost risk
-    if (next_24h["Temp_Min"] <= 0).any():
-        frost_time = next_24h[next_24h["Temp_Min"] <= 0]["Datetime"].min()
-        alerts.append({
-            "type": "danger",
-            "icon": "❄️",
-            "title": "FROST RISK",
-            "message": f"Freezing temps expected at {frost_time.strftime('%I%p %a')}",
-            "action": "Delay irrigation. Protect sensitive crops."
-        })
-    
-    # Heat stress
-    if (next_24h["Temp_Max"] >= 35).any():
-        alerts.append({
-            "type": "warn",
-            "icon": "🔥",
-            "title": "HEAT STRESS",
-            "message": f"High temps up to {next_24h['Temp_Max'].max():.0f}°C expected",
-            "action": "Increase irrigation frequency. Monitor crop stress."
-        })
-    
-    # High wind
-    if (next_48h["Wind"] >= 6.0).any():
-        alerts.append({
-            "type": "warn",
-            "icon": "💨",
-            "title": "HIGH WIND",
-            "message": f"Wind speeds up to {next_48h['Wind'].max():.1f} m/s",
-            "action": "Avoid spraying. Risk of drift/evaporation."
-        })
-    
-    # Heavy rain
-    if (next_24h["Rain_3h"] >= 10).any() or (next_24h["POP"] >= 70).any():
-        total_rain = next_24h["Rain_3h"].sum()
-        alerts.append({
-            "type": "info",
-            "icon": "🌧️",
-            "title": "HEAVY RAIN EXPECTED",
-            "message": f"Up to {total_rain:.1f}mm in next 24h",
-            "action": "Delay irrigation and field operations."
-        })
-    
-    # Ideal spray window
-    ideal_conditions = (
-        (next_48h["Temperature"].between(10, 28)) &
-        (next_48h["Humidity"].between(40, 80)) &
-        (next_48h["Wind"] < 6.0) &
-        (next_48h["POP"] < 20)
-    )
-    if ideal_conditions.any():
-        ideal_df = next_48h[ideal_conditions]
-        window_start = ideal_df["Datetime"].min()
-        window_end = ideal_df["Datetime"].max()
-        alerts.append({
-            "type": "success",
-            "icon": "✅",
-            "title": "SPRAY WINDOW",
-            "message": f"Ideal conditions from {window_start.strftime('%I%p')} to {window_end.strftime('%I%p %a')}",
-            "action": "Schedule spray applications during this window."
-        })
-    
-    return alerts
-
-# =========================
-# DATA LOADING
-# =========================
-@st.cache_data(show_spinner=False)
-def load_climate(path: str, sheet: str) -> pd.DataFrame:
-    """Load and validate climate data from Excel"""
-    df = pd.read_excel(path, sheet_name=sheet)
-    df.rename(columns={c: c.strip().replace("\u00A0", " ") for c in df.columns}, inplace=True)
-    missing = [c for c in REQUIRED if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in `{sheet}`: {missing}")
-    df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
-    df = df.dropna(subset=[COL_DATE])
-    for col in [COL_TMIN, COL_TMAX, COL_RHMIN, COL_RHMAX, COL_U2, COL_RS, COL_PCP]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=[COL_TMIN, COL_TMAX, COL_RHMIN, COL_RHMAX, COL_U2, COL_RS, COL_PCP])
-    df["DOY"] = df[COL_DATE].dt.dayofyear
-    return df.sort_values(COL_DATE).reset_index(drop=True)
-
-@st.cache_data(show_spinner=False)
-def compute_et(df: pd.DataFrame, z_m: float, latitude_rad: float) -> pd.DataFrame:
-    """Calculate reference ET (ETo and ETr) for all records"""
-    lat_deg = float(latitude_rad) * 180.0 / math.pi
-    eto_vals, etr_vals = [], []
-    for _, r in df.iterrows():
-        eto = ascedaily("S", z_m, lat_deg, int(r["DOY"]),
-                        r[COL_RS], r[COL_TMAX], r[COL_TMIN],
-                        rhmax=r[COL_RHMAX], rhmin=r[COL_RHMIN],
-                        wndsp=r[COL_U2], wndht=2.0)
-        etr = ascedaily("T", z_m, lat_deg, int(r["DOY"]),
-                        r[COL_RS], r[COL_TMAX], r[COL_TMIN],
-                        rhmax=r[COL_RHMAX], rhmin=r[COL_RHMIN],
-                        wndsp=r[COL_U2], wndht=2.0)
-        eto_vals.append(eto)
-        etr_vals.append(etr)
-    out = df.copy()
-    out["ETo (mm)"] = pd.to_numeric(eto_vals, errors="coerce")
-    out["ETr (mm)"] = pd.to_numeric(etr_vals, errors="coerce")
-    return out
-
-def agg_df(df: pd.DataFrame, freq: str, cols_sum=None, cols_mean=None):
-    """Aggregate data by time period (Weekly/Monthly)"""
-    cols_sum = cols_sum or []
-    cols_mean = cols_mean or []
-    g = df.set_index(COL_DATE).groupby(pd.Grouper(freq=freq))
-    parts = []
-    if cols_sum: parts.append(g[cols_sum].sum())
-    if cols_mean: parts.append(g[cols_mean].mean())
-    if parts:
-        agg = pd.concat(parts, axis=1).reset_index()
-        return agg
-    return df.copy()
-
-def _bytes_from_figure(fig):
-    """Convert plotly figure to PNG bytes"""
-    buf = io.BytesIO()
-    try:
-        fig.write_image(buf, format="png", scale=2)
-        return buf.getvalue()
-    except Exception:
-        return None
-
-def download_button_for_figure(fig, filename="chart.png", label="⬇️ Download PNG"):
-    """Create download button for plotly figure"""
-    b = _bytes_from_figure(fig)
-    if b is None:
-        st.caption("PNG export needs `kaleido` (`pip install -U kaleido`).")
-        return
-    st.download_button(label, b, file_name=filename, mime="image/png")
 
 # =========================
 # SIDEBAR CONTROLS
 # =========================
 st.sidebar.title("⚙️ Weather Controls")
-st.sidebar.markdown(f"**Station:** {STATION_ID}")
-st.sidebar.markdown('<p class="help-text">Configure all weather analysis parameters below</p>', unsafe_allow_html=True)
+st.sidebar.markdown('<p class="help-text">Choose between bundled sample data or upload your own workbook.</p>', unsafe_allow_html=True)
+
+with st.sidebar.expander("📂 Data Source", expanded=True):
+    data_mode = st.radio("Data input", ["Sample dataset", "Upload workbook"], index=0)
+    sheet_name = st.text_input("Sheet name", value=DEFAULT_SHEET)
+    station_label = st.text_input("Station label", value=DEFAULT_STATION)
+    if data_mode == "Upload workbook":
+        climate_file = st.file_uploader("Climate workbook", type=["xlsx", "xls"])
+    else:
+        climate_file = DEFAULT_CLIMATE_PATH
+
+if data_mode == "Upload workbook" and climate_file is None:
+    st.sidebar.info("Upload a workbook or switch to the bundled sample dataset.")
+    st.stop()
+
+st.sidebar.markdown(f"**Station:** {station_label}")
 
 with st.sidebar.expander("📍 Station Settings", expanded=False):
     st.markdown('<p class="help-text">Adjust for your specific location</p>', unsafe_allow_html=True)
@@ -450,6 +161,8 @@ with st.sidebar.expander("🌱 Crop Settings", expanded=True):
                                   help="Date when crop was planted")
     use_harvest = st.checkbox("Set Harvest Date?", value=False)
     harvest_date = st.date_input("Harvest Date", value=dt.date(2024, 10, 31)) if use_harvest else None
+    gdd_target = st.number_input("Target cumulative GDD", value=0.0, step=50.0,
+                                 help="Set to compare current accumulation vs. seasonal target (optional)")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📅 Date Range")
@@ -502,15 +215,44 @@ allow_download = st.sidebar.checkbox("Show download buttons", value=True)
 # LOAD AND PROCESS DATA
 # =========================
 try:
-    df = load_climate(FILE_PATH, SHEET_NAME)
+    df = load_climate(
+        climate_file,
+        sheet_name,
+        required_columns=REQUIRED,
+        date_column=COL_DATE,
+        numeric_columns=CLIMATE_NUMERIC_COLS,
+    )
 except Exception as e:
     st.error(f"❌ Could not read data: {e}")
     st.stop()
 
-df_et = compute_et(df, elevation_m, latitude_rad)
+df_et = compute_et(
+    df,
+    elevation_m,
+    latitude_rad,
+    rs_col=COL_RS,
+    tmax_col=COL_TMAX,
+    tmin_col=COL_TMIN,
+    rhmax_col=COL_RHMAX,
+    rhmin_col=COL_RHMIN,
+    wind_col=COL_U2,
+    date_col=COL_DATE,
+)
 pdate = pd.Timestamp(planting_date)
 hdate = pd.Timestamp(harvest_date) if harvest_date else None
-df_full = compute_gdd_columns(df_et, gdd_base, gdd_cap, pdate, hdate)
+df_full = compute_gdd_columns(
+    df_et,
+    date_col=COL_DATE,
+    tmin_col=COL_TMIN,
+    tmax_col=COL_TMAX,
+    tbase=gdd_base,
+    tcap=gdd_cap,
+    planting_date=pdate,
+    harvest_date=hdate,
+    gdd_daily_col=COL_GDD_STD_DAILY,
+    gdd_fp_daily_col=COL_GDD_FP_DAILY,
+    gdd_fp_cum_col=COL_GDD_FP_CUM,
+)
 
 # Date filtering
 dmin, dmax = df_full[COL_DATE].min().date(), df_full[COL_DATE].max().date()
@@ -531,18 +273,36 @@ dfx = df_full.loc[m].copy()
 
 # Aggregation
 if agg_choice == "Weekly":
-    dfa = agg_df(dfx, "W",
-                 cols_sum=[COL_PCP, "ETo (mm)", "ETr (mm)", COL_GDD_STD_DAILY, COL_GDD_FP_DAILY],
-                 cols_mean=[COL_TMAX, COL_TMIN, COL_U2, COL_RHMAX, COL_RHMIN, COL_RS])
+    dfa = agg_df(
+        dfx,
+        COL_DATE,
+        "W",
+        cols_sum=[COL_PCP, "ETo (mm)", "ETr (mm)", COL_GDD_STD_DAILY, COL_GDD_FP_DAILY],
+        cols_mean=[COL_TMAX, COL_TMIN, COL_U2, COL_RHMAX, COL_RHMIN, COL_RS],
+    )
 elif agg_choice == "Monthly":
-    dfa = agg_df(dfx, "MS",
-                 cols_sum=[COL_PCP, "ETo (mm)", "ETr (mm)", COL_GDD_STD_DAILY, COL_GDD_FP_DAILY],
-                 cols_mean=[COL_TMAX, COL_TMIN, COL_U2, COL_RHMAX, COL_RHMIN, COL_RS])
+    dfa = agg_df(
+        dfx,
+        COL_DATE,
+        "MS",
+        cols_sum=[COL_PCP, "ETo (mm)", "ETr (mm)", COL_GDD_STD_DAILY, COL_GDD_FP_DAILY],
+        cols_mean=[COL_TMAX, COL_TMIN, COL_U2, COL_RHMAX, COL_RHMIN, COL_RS],
+    )
 else:
     dfa = dfx.copy()
 
 if COL_GDD_FP_DAILY in dfa.columns:
     dfa[COL_GDD_FP_CUM] = dfa[COL_GDD_FP_DAILY].cumsum()
+
+# Precompute irrigation decision inputs for rain tab
+recent_precip = dfx[COL_PCP].tail(7).sum() if COL_PCP in dfx.columns else 0.0
+recent_eto = dfx["ETo (mm)"].tail(7).sum() if "ETo (mm)" in dfx.columns else 0.0
+decision = calculate_irrigation_decision(
+    recent_precip_mm=float(recent_precip),
+    eto_mm=float(recent_eto),
+    growth_stage=growth_stage,
+    cost_per_inch=irrigation_cost_per_inch,
+)
 
 # Apply rolling average if enabled
 if roll_toggle:
@@ -589,8 +349,12 @@ if fc_data and fc_data.get("cod") == "200":
 # =========================
 # MAIN DASHBOARD - TABS
 # =========================
-tab_data, tab_et, tab_owm, tab_ai = st.tabs([
-    "📈 Data & Charts", "💧 Reference ET", "🌦️ Current & Forecast", "🤖 AI Insights"
+tab_data, tab_et, tab_rain, tab_owm, tab_ai = st.tabs([
+    "📊 Weather Overview",
+    "💧 Reference ET",
+    "🌧️ Rain & Irrigation",
+    "🌍 Current & Forecast",
+    "🤖 AI Insights",
 ])
 
 # ===================================================
@@ -642,23 +406,6 @@ with tab_data:
     # st.markdown("**Reasoning:**")
     # for reason in decision["reasoning"]:
     #     st.markdown(f"• {reason}")
-    
-    # What-if simulation
-    #if simulated_irrigation_in > 0:
-   #     st.markdown("---")
-    #    st.markdown(f"**💡 What-If Scenario:** Adding {simulated_irrigation_in} inches")
-    #    sim_col1, sim_col2, sim_col3 = st.columns(3)
- #       with sim_col1:
-  #          st.metric("New Deficit", f"{simulated_deficit:.1f} mm",
-   #                   delta=f"{simulated_deficit - decision['water_deficit_mm']:.1f} mm",
-    #                  delta_color="inverse")
-  #      with sim_col2:
- #           st.metric("Simulated Cost", f"${simulated_cost:.2f}/acre")
-  #      with sim_col3:
-   #         water_use_efficiency = (simulated_irrigation_in / decision['eto_mm'] * 25.4 * 100) if decision['eto_mm'] > 0 else 0
-    #        st.metric("Water Use Efficiency", f"{water_use_efficiency:.1f}%")
-    
-  #  st.markdown('</div>', unsafe_allow_html=True)
     
     # =========================
     # NEW! SMART ALERTS
@@ -731,203 +478,55 @@ with tab_data:
         with c5: st.metric("Mean RHmin", f"{dfx[COL_RHMIN].mean():.0f} %")
         with c6: st.metric("Mean Solar", f"{dfx[COL_RS].mean():.1f} MJ/m²")
         st.caption("💡 Tip: Switch to **Graphs** mode in the sidebar for detailed time-series visualization.")
+        trend_fig = None
     else:
-        # =========================
-        # MAIN OVERLAY CHART
-        # =========================
         st.markdown("### 📈 Weather Trends")
         st.markdown('<p class="help-text">Multi-variable overlay chart with dual axes for temperature/variables (left) and precipitation (right)</p>', unsafe_allow_html=True)
-        
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        x = dfa[COL_DATE]
-        primary_cols = [v for v in plot_vars if v != COL_PCP and v in dfa.columns]
-        secondary_cols = [COL_PCP] if (COL_PCP in plot_vars and COL_PCP in dfa.columns) else []
-        
-        if secondary_cols and dfa[COL_PCP].notna().any():
-            fig.add_bar(name="Precip (mm)", x=x, y=dfa[COL_PCP], opacity=0.55, secondary_y=True)
-        
-        primary_count = 0
-        for col in primary_cols:
-            s = dfa[col]
-            if s.notna().any():
-                fig.add_trace(go.Scatter(name=col, x=x, y=s, mode="lines+markers",
-                                         line=dict(width=2), marker=dict(size=5)), secondary_y=False)
-                primary_count += 1
-        
-        if primary_count == 0 and secondary_cols and dfa[COL_PCP].notna().any():
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.add_bar(name="Precip (mm)", x=x, y=dfa[COL_PCP], opacity=0.55, secondary_y=False)
-            primary_cols = []
-        
-        def finite_minmax(series_list):
-            vals = pd.concat(series_list, axis=0) if series_list else pd.Series(dtype=float)
-            vals = pd.to_numeric(vals, errors="coerce")
-            vals = vals[np.isfinite(vals)]
-            if len(vals) == 0:
-                return None, None
-            return float(vals.min()), float(vals.max())
-        
-        prim_series = [dfa[c] for c in primary_cols if c in dfa.columns]
-        ymin, ymax = finite_minmax(prim_series)
-        if ymin is not None and ymax is not None and ymin != ymax:
-            pad = 0.05 * (ymax - ymin)
-            fig.update_yaxes(range=[ymin - pad, ymax + pad], secondary_y=False)
-        
-        if COL_PCP in secondary_cols and dfa[COL_PCP].notna().any():
-            y2min, y2max = finite_minmax([dfa[COL_PCP]])
-            if y2min is not None and y2max is not None:
-                pad2 = 0.1 * max(1.0, (y2max - y2min))
-                fig.update_yaxes(range=[0, y2max + pad2], secondary_y=True)
-        
-        fig.update_layout(height=520, margin=dict(l=10, r=10, t=40, b=10),
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                          template="plotly_white")
+        trend_cols = [v for v in plot_vars if v != COL_PCP and v in dfa.columns]
+        trend_fig = weather_trend_figure(dfa, COL_DATE, COL_PCP, trend_cols, cumulative=cum_toggle)
         if len(dfa):
-            fig.update_xaxes(title_text="Date", range=[dfa[COL_DATE].min(), dfa[COL_DATE].max()])
-        else:
-            fig.update_xaxes(title_text="Date")
-        fig.update_yaxes(title_text="Value", secondary_y=False)
-        fig.update_yaxes(title_text=("Precip / Cumulative (mm)" if cum_toggle else "Precip (mm)"), secondary_y=True)
-        
-        # Add data source badge
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"📊 Data source: Local file | Aggregation: {agg_choice} | Points: {len(dfa)}")
-        
-        # =========================
-        # NEW! CUMULATIVE WATER BALANCE
-        # =========================
-        st.markdown("---")
-        st.markdown("### 💧 Cumulative Water Balance")
-        st.markdown('<p class="help-text">Shows cumulative precipitation vs. ET demand over time, with the balance (surplus/deficit) highlighted</p>', unsafe_allow_html=True)
-        
-        if "ETo (mm)" in dfx.columns and COL_PCP in dfx.columns:
-            water_balance = dfx.copy()
-            water_balance["Cumulative_Precip"] = water_balance[COL_PCP].cumsum()
-            water_balance["Cumulative_ETo"] = water_balance["ETo (mm)"].cumsum()
-            water_balance["Balance"] = water_balance["Cumulative_Precip"] - water_balance["Cumulative_ETo"]
-            
-            fig_balance = go.Figure()
-            fig_balance.add_trace(go.Scatter(
-                x=water_balance[COL_DATE], y=water_balance["Cumulative_Precip"],
-                mode="lines", name="Cumulative Precip", line=dict(color="blue", width=2)
-            ))
-            fig_balance.add_trace(go.Scatter(
-                x=water_balance[COL_DATE], y=water_balance["Cumulative_ETo"],
-                mode="lines", name="Cumulative ETo", line=dict(color="orange", width=2)
-            ))
-            fig_balance.add_trace(go.Scatter(
-                x=water_balance[COL_DATE], y=water_balance["Balance"],
-                mode="lines", name="Balance (Precip - ETo)",
-                line=dict(color="green", width=2, dash="dash"),
-                fill='tozeroy', fillcolor='rgba(0,255,0,0.1)'
-            ))
-            
-            fig_balance.update_layout(
-                height=350,
-                template="plotly_white",
-                legend=dict(orientation="h"),
-                yaxis_title="Cumulative (mm)",
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig_balance, use_container_width=True)
-            
-            # Balance summary
-            final_balance = water_balance["Balance"].iloc[-1]
-            if final_balance < 0:
-                st.warning(f"⚠️ Water deficit of {abs(final_balance):.1f} mm detected. Consider irrigation.")
-            else:
-                st.success(f"✅ Water surplus of {final_balance:.1f} mm. Adequate moisture available.")
-        
-        # =========================
-        # HISTORICAL TEMPERATURE CALENDAR (ORIGINAL)
-        # =========================
-        st.markdown("---")
-        st.markdown("### 🗓️ Historical Temperature Calendar")
-        st.markdown('<p class="help-text">Heatmap showing average daily temperature by day-of-year across all years in the dataset</p>', unsafe_allow_html=True)
-        
-        temp_var_to_plot = st.radio("Temperature Variable:", (COL_TMAX, COL_TMIN), index=0,
-                                    horizontal=True, key="temp_calendar_selector")
-        df_heatmap = df_et.copy()
-        df_heatmap['Month'] = df_heatmap[COL_DATE].dt.month
-        df_heatmap['DayOfMonth'] = df_heatmap[COL_DATE].dt.day
-        avg_daily_temp = df_heatmap.groupby(['Month', 'DayOfMonth'])[temp_var_to_plot].mean().reset_index()
-        pivot_table = avg_daily_temp.pivot_table(index='DayOfMonth', columns='Month', values=temp_var_to_plot)
-        pivot_table = pivot_table.sort_index(axis=1)
-        month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
-        x_axis_labels = [month_names[i-1] for i in pivot_table.columns]
-        fig_heatmap = px.imshow(pivot_table, x=x_axis_labels, y=pivot_table.index,
-                                color_continuous_scale=px.colors.sequential.thermal,
-                                aspect="auto",
-                                title=f"Historical Average Daily {temp_var_to_plot}",
-                                labels=dict(x="Month", y="Day of Month", color="Avg Temp (°C)"))
-        fig_heatmap.update_layout(height=600, margin=dict(l=10, r=10, t=50, b=10), title_x=0.5)
-        fig_heatmap.update_traces(hovertemplate="<b>Month:</b> %{x}<br><b>Day:</b> %{y}<br><b>Avg Temp:</b> %{z:.1f}°C<extra></extra>")
-        fig_heatmap.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+            trend_fig.update_xaxes(range=[dfa[COL_DATE].min(), dfa[COL_DATE].max()])
+        st.plotly_chart(trend_fig, width="stretch")
+        st.caption(f"📊 Data source: {getattr(climate_file, 'name', 'upload')} | Aggregation: {agg_choice} | Points: {len(dfa)}")
+        if allow_download and trend_fig is not None:
+            download_button_for_figure(trend_fig, filename="weather_trends.png")
+
+    st.markdown("---")
+    st.markdown("### 🗓️ Historical Temperature Calendar")
+    st.markdown('<p class="help-text">Heatmap showing average daily temperature by day-of-year across all years in the dataset</p>', unsafe_allow_html=True)
+
+    temp_var_to_plot = st.radio("Temperature Variable:", (COL_TMAX, COL_TMIN), index=0, horizontal=True, key="temp_calendar_selector")
+    pivot_table = temperature_calendar(df_et, COL_DATE, temp_var_to_plot)
+    if not pivot_table.empty:
+        fig_heatmap = temperature_calendar_heatmap(pivot_table, f"Historical Average Daily {temp_var_to_plot}")
+        st.plotly_chart(fig_heatmap, width="stretch")
         if allow_download:
             download_button_for_figure(fig_heatmap, filename="avg_daily_temp_heatmap.png")
-        
-        # =========================
-        # GDD ANALYSIS (ORIGINAL)
-        # =========================
-        st.markdown("---")
-        st.markdown("### 🌡️ Growing Degree Days (GDD)")
-        st.markdown('<p class="help-text">GDD accumulation from planting date using base and cap temperatures set in the sidebar</p>', unsafe_allow_html=True)
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            if COL_GDD_FP_DAILY in dfa.columns:
-                st.subheader("Daily GDD (from planting)")
-                fig_gdd_daily = px.bar(dfa, x=COL_DATE, y=COL_GDD_FP_DAILY,
-                                       title="Daily GDD (°C·day)",
-                                       template="plotly_white")
-                fig_gdd_daily.update_traces(marker_color="lightgreen")
-                st.plotly_chart(fig_gdd_daily, use_container_width=True)
-        with c2:
-            if COL_GDD_FP_CUM in dfa.columns:
-                st.subheader("Cumulative GDD (from planting)")
-                fig_gdd_cum = px.line(dfa, x=COL_DATE, y=COL_GDD_FP_CUM,
-                                      title="ΣGDD from planting (°C·day)",
-                                      markers=True, template="plotly_white")
-                fig_gdd_cum.update_traces(line_color="darkgreen")
-                st.plotly_chart(fig_gdd_cum, use_container_width=True)
-        
-        # Current GDD status
-        if COL_GDD_FP_CUM in dfx.columns and len(dfx) > 0:
-            current_gdd = dfx[COL_GDD_FP_CUM].iloc[-1]
-            days_since_planting = (dfx[COL_DATE].iloc[-1] - pdate).days
-            st.info(f"📊 **Current GDD Status:** {current_gdd:.1f}°C·day accumulated over {days_since_planting} days since planting ({planting_date})")
-        
-        # =========================
-        # DATA QUALITY CHECK (ORIGINAL)
-        # =========================
-        with st.expander("🔎 Data Quality Check"):
-            st.markdown("View first 5 rows, data types, and non-null counts to verify data integrity")
-            cols_show = [c for c in plot_vars if c in dfa.columns]
-            extra = [COL_GDD_STD_DAILY, COL_GDD_FP_DAILY, COL_GDD_FP_CUM]
-            show = [COL_DATE] + sorted(list(set(cols_show + extra)))
-            show = [c for c in show if c in dfa.columns]
-            st.dataframe(dfa[show].head(), use_container_width=True)
-            st.write("**Data Types:**", dfa[show].dtypes.to_frame("dtype"))
-            st.write("**Non-null Counts:**")
-            st.write(dfa[show].notna().sum())
-        
-        # =========================
-        # DOWNLOADS (ORIGINAL)
-        # =========================
-        if allow_download:
-            st.markdown("---")
-            st.markdown("### 📥 Export Data")
-            st.markdown('<p class="help-text">Download filtered dataset and charts for external analysis</p>', unsafe_allow_html=True)
-            
-            dl_col1, dl_col2 = st.columns(2)
-            with dl_col1:
-                csv = dfa.to_csv(index=False).encode("utf-8")
-                st.download_button("📄 Download Data (CSV)", csv,
-                                  file_name=f"weather_data_{start}_{end}.csv",
-                                  mime="text/csv")
-            with dl_col2:
-                download_button_for_figure(fig, filename="weather_trends.png")
+
+    # =========================
+    # GDD ANALYSIS (ORIGINAL)
+    # =========================
+    st.markdown("---")
+    st.markdown("### 🌡️ Growing Degree Days (GDD)")
+    st.markdown('<p class="help-text">GDD accumulation from planting date using base and cap temperatures set in the sidebar</p>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if COL_GDD_FP_DAILY in dfa.columns:
+            st.subheader("Daily GDD (from planting)")
+            fig_gdd_daily = gdd_daily_bar(dfa, COL_DATE, COL_GDD_FP_DAILY)
+            st.plotly_chart(fig_gdd_daily, width="stretch")
+    with c2:
+        if COL_GDD_FP_CUM in dfa.columns:
+            st.subheader("Cumulative GDD (from planting)")
+            fig_gdd_cum = gdd_cumulative_line(dfa, COL_DATE, COL_GDD_FP_CUM)
+            st.plotly_chart(fig_gdd_cum, width="stretch")
+
+    # Current GDD status
+    if COL_GDD_FP_CUM in dfx.columns and len(dfx) > 0:
+        current_gdd = dfx[COL_GDD_FP_CUM].iloc[-1]
+        days_since_planting = (dfx[COL_DATE].iloc[-1] - pdate).days
+        st.info(f"📊 **Current GDD Status:** {current_gdd:.1f}°C·day accumulated over {days_since_planting} days since planting ({planting_date})")
 
 # ===================================================
 # TAB 2: REFERENCE ET (ORIGINAL)
@@ -937,8 +536,21 @@ with tab_et:
     st.markdown('<p class="section-desc">ASCE Standardized Penman-Monteith calculations for short (grass/ETo) and tall (alfalfa/ETr) reference crops. Use these values to estimate crop water use when multiplied by crop coefficients (Kc).</p>', unsafe_allow_html=True)
     
     try:
-        df = load_climate(FILE_PATH, SHEET_NAME)
-        df_et = compute_et(df, elevation_m, latitude_rad)
+        df_et = load_climate_with_et(
+            climate_file,
+            sheet_name,
+            required_columns=REQUIRED,
+            date_column=COL_DATE,
+            numeric_columns=CLIMATE_NUMERIC_COLS,
+            elevation_m=elevation_m,
+            latitude_rad=latitude_rad,
+            rs_col=COL_RS,
+            tmax_col=COL_TMAX,
+            tmin_col=COL_TMIN,
+            rhmax_col=COL_RHMAX,
+            rhmin_col=COL_RHMIN,
+            wind_col=COL_U2,
+        )
     except Exception as e:
         st.error(f"ET calculation error: {e}")
         st.stop()
@@ -951,20 +563,13 @@ with tab_et:
         dfe["ETo (mm)"] = dfe["ETo (mm)"].rolling(7, min_periods=1).mean()
         dfe["ETr (mm)"] = dfe["ETr (mm)"].rolling(7, min_periods=1).mean()
     elif et_view == "Monthly totals":
-        dfe = agg_df(dfe, "MS", cols_sum=["ETo (mm)", "ETr (mm)"])
+        dfe = agg_df(dfe, COL_DATE, "MS", cols_sum=["ETo (mm)", "ETr (mm)"])
     elif et_view == "Cumulative since start":
         dfe["ETo (mm)"] = dfe["ETo (mm)"].cumsum()
         dfe["ETr (mm)"] = dfe["ETr (mm)"].cumsum()
     
-    fig_et = go.Figure()
-    fig_et.add_trace(go.Scatter(x=dfe[COL_DATE], y=dfe["ETo (mm)"],
-                                mode="lines+markers", name="ETo (short reference)"))
-    fig_et.add_trace(go.Scatter(x=dfe[COL_DATE], y=dfe["ETr (mm)"],
-                                mode="lines+markers", name="ETr (tall reference)"))
-    fig_et.update_layout(height=480, margin=dict(l=10, r=10, t=40, b=10),
-                        legend=dict(orientation="h"), template="plotly_white",
-                        yaxis_title="ET (mm)", hovermode='x unified')
-    st.plotly_chart(fig_et, use_container_width=True)
+    fig_et = et_reference_figure(dfe, COL_DATE)
+    st.plotly_chart(fig_et, width="stretch")
     
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Avg ETo (mm/day)", f"{df_et['ETo (mm)'].mean():.2f}")
@@ -997,6 +602,113 @@ with tab_et:
         ETc = Kc × ETo
         ```
         """)
+
+
+with tab_rain:
+    st.title("🌧️ Rainfall & Irrigation Planner")
+    st.markdown('<p class="section-desc">Assess rainfall patterns, water balance, and irrigation recommendations for the filtered period.</p>', unsafe_allow_html=True)
+
+    total_rain = float(dfx[COL_PCP].sum()) if COL_PCP in dfx.columns else 0.0
+    avg_daily_rain = float(dfx[COL_PCP].mean()) if COL_PCP in dfx.columns else 0.0
+    heaviest_row = None
+    if COL_PCP in dfx.columns and not dfx.empty:
+        heaviest_row = dfx.loc[dfx[COL_PCP].idxmax()]
+    deficit_total = float(dfx["ETo (mm)"].sum() - total_rain) if "ETo (mm)" in dfx.columns else None
+
+    rain_cols = st.columns(4)
+    with rain_cols[0]:
+        st.metric("Total Rain", f"{total_rain:.1f} mm")
+    with rain_cols[1]:
+        st.metric("Avg Daily", f"{avg_daily_rain:.1f} mm" if avg_daily_rain else "n/a")
+    with rain_cols[2]:
+        if heaviest_row is not None:
+            st.metric(
+                "Heaviest Day",
+                heaviest_row[COL_DATE].date().isoformat(),
+                delta=f"{heaviest_row[COL_PCP]:.1f} mm",
+            )
+        else:
+            st.metric("Heaviest Day", "n/a")
+    with rain_cols[3]:
+        if deficit_total is not None:
+            st.metric("Water Balance", f"{deficit_total:.1f} mm", delta="ETo - Rain")
+        else:
+            st.metric("Water Balance", "n/a")
+
+    last_wet = None
+    if COL_PCP in dfx.columns:
+        wet_days = dfx[dfx[COL_PCP] >= 2][COL_DATE]
+        if not wet_days.empty:
+            last_wet = wet_days.max()
+    if last_wet is not None:
+        days_since = (dfx[COL_DATE].max() - last_wet).days
+        st.caption(f"🌦️ Days since ≥2 mm rain: {days_since} days (last on {last_wet.date()})")
+
+    st.markdown("### 📊 Daily Rainfall Hyetograph")
+    if COL_PCP in dfx.columns and len(dfx):
+        rain_fig = rainfall_bar_chart(dfx, COL_DATE, COL_PCP)
+        st.plotly_chart(rain_fig, width="stretch")
+        if allow_download:
+            download_button_for_figure(rain_fig, filename="daily_rainfall.png")
+    else:
+        st.info("Rainfall data unavailable for this period.")
+
+    st.markdown("---")
+    st.markdown("### 💧 Cumulative Water Balance")
+    st.markdown('<p class="help-text">Compare cumulative rainfall against ET demand to highlight deficits or surpluses.</p>', unsafe_allow_html=True)
+    balance_df = compute_water_balance(dfx, COL_DATE, COL_PCP, "ETo (mm)")
+    if not balance_df.empty:
+        fig_balance = water_balance_figure(balance_df, COL_DATE)
+        st.plotly_chart(fig_balance, width="stretch")
+        final_balance = balance_df["Balance"].iloc[-1]
+        if final_balance < 0:
+            st.warning(f"⚠️ Water deficit of {abs(final_balance):.1f} mm detected. Consider irrigation.")
+        else:
+            st.success(f"✅ Water surplus of {final_balance:.1f} mm. Adequate moisture available.")
+        if allow_download:
+            download_button_for_figure(fig_balance, filename="water_balance.png")
+    else:
+        st.caption("Water balance chart unavailable (missing ETo/precip columns).")
+
+    st.markdown("---")
+    st.markdown("### 💦 Irrigation Decision Support")
+    st.markdown('<div class="decision-card">', unsafe_allow_html=True)
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Water Deficit", f"{decision['water_deficit_mm']:.1f} mm",
+                  delta=f"ETo {decision['eto_mm']:.1f} − Rain {decision['effective_rain_mm']:.1f}")
+    with cols[1]:
+        if decision["irrigate"]:
+            st.metric("Recommended", f"{decision['inches_needed']} in", f"${decision['cost_usd']:.2f}/acre")
+        else:
+            st.metric("Recommended", "No irrigation")
+    with cols[2]:
+        st.metric("Cost / inch", f"${irrigation_cost_per_inch:.0f}")
+    st.markdown("<ul>" + "".join(f"<li>{msg}</li>" for msg in decision["reasoning"]) + "</ul>", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if simulated_irrigation_in > 0:
+        sim_deficit = decision["water_deficit_mm"] - (simulated_irrigation_in * 25.4)
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            st.metric("Simulated Deficit", f"{sim_deficit:.1f} mm",
+                      delta=f"{sim_deficit - decision['water_deficit_mm']:.1f} mm",
+                      delta_color="inverse")
+        with sc2:
+            st.metric("Added Water", f"{simulated_irrigation_in:.2f} in")
+        with sc3:
+            st.metric("Added Cost", f"${simulated_irrigation_in * irrigation_cost_per_inch:.2f}/acre")
+
+    st.markdown("---")
+    st.markdown("### 🌦️ Rainfall Events & Weekly Totals")
+    top_events = dfx[[COL_DATE, COL_PCP]].sort_values(COL_PCP, ascending=False).head(10)
+    if not top_events.empty:
+        st.dataframe(top_events.rename(columns={COL_DATE: "Date", COL_PCP: "Rain (mm)"}), hide_index=True, use_container_width=True)
+    weekly = agg_df(dfx, COL_DATE, "W", cols_sum=[COL_PCP])
+    if not weekly.empty:
+        weekly = weekly.rename(columns={COL_DATE: "Week", COL_PCP: "Rain (mm)"})
+        st.dataframe(weekly, hide_index=True, use_container_width=True)
+
 
 # ===================================================
 # TAB 3: CURRENT & FORECAST (ORIGINAL + SATELLITE MAP)
@@ -1227,7 +939,7 @@ with tab_owm:
             fig24.update_yaxes(title_text="POP (%)", range=[0, 100], secondary_y=True)
             fig24.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10),
                                 template="plotly_white", legend=dict(orientation="h"))
-            st.plotly_chart(fig24, use_container_width=True)
+            st.plotly_chart(fig24, width="stretch")
             
             cA, cB = st.columns([1,1])
             with cA:
@@ -1267,18 +979,10 @@ with tab_owm:
             pick = st.radio("Drill-down day", options=list(daily["Date"].astype(str)), index=0, horizontal=True)
             dd = dff_owm[dff_owm["Date"] == pd.to_datetime(pick).date()]
             if not dd.empty:
-                fig_dd = go.Figure()
-                fig_dd.add_trace(go.Scatter(x=dd["Datetime"], y=dd["Temp_Min"], mode="lines", line=dict(width=0), name="Min"))
-                fig_dd.add_trace(go.Scatter(x=dd["Datetime"], y=dd["Temp_Max"], mode="lines",
-                                            fill='tonexty', fillcolor="rgba(255,165,0,0.15)",
-                                            line=dict(width=0), name="Max"))
-                fig_dd.add_trace(go.Scatter(x=dd["Datetime"], y=dd["Temperature"], mode="lines+markers",
-                                            name=f"Temp ({temp_unit})", line=dict(width=2)))
-                fig_dd.update_layout(height=340, template="plotly_white",
-                                     margin=dict(l=10,r=10,t=10,b=10), legend=dict(orientation="h"))
-                st.plotly_chart(fig_dd, use_container_width=True)
+                fig_dd = forecast_daily_temp_band(dd, temp_unit)
+                st.plotly_chart(fig_dd, width="stretch")
         
-    with ft_charts:
+        with ft_charts:
             st.markdown("#### Wind Rose (next 5 days)")
             st.markdown('<p class="help-text">Average wind speed by direction across the forecast period</p>', unsafe_allow_html=True)
             if "WindDeg" in dff_owm.columns and dff_owm["WindDeg"].notna().any():
@@ -1291,7 +995,7 @@ with tab_owm:
                                                 marker_line_color="white", marker_line_width=1, opacity=0.85, name="Mean wind"))
                 fig_rose.update_layout(height=340, template="plotly_white",
                                        margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
-                st.plotly_chart(fig_rose, use_container_width=True)
+                st.plotly_chart(fig_rose, width="stretch")
             else:
                 st.info("No wind direction data.")
             
@@ -1308,7 +1012,7 @@ with tab_owm:
             fig_combo.update_yaxes(title_text="Rain (mm)", secondary_y=True)
             fig_combo.update_layout(height=360, template="plotly_white",
                                     margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
-            st.plotly_chart(fig_combo, use_container_width=True)
+            st.plotly_chart(fig_combo, width="stretch")
     
     # NEW! Satellite map
     if curr and curr.get("coord"):
@@ -1367,7 +1071,24 @@ with tab_ai:
     else:
         client = OpenAI(api_key=OPENAI_API_KEY)
     
-    # Helper functions for AI
+    forecast_context = dff if not dff.empty else dff_owm
+    weather_tool_context = {
+        "date_col": COL_DATE,
+        "precip_col": COL_PCP,
+        "eto_col": "ETo (mm)",
+        "gdd_col": COL_GDD_FP_CUM,
+        "planting_date": planting_date,
+        "growth_stage": growth_stage,
+        "cost_per_inch": irrigation_cost_per_inch,
+    }
+    tool_definitions = weather_tools.WEATHER_TOOL_DEFINITIONS
+
+    def execute_tool_call(tool_name, tool_args):
+        try:
+            return weather_tools.execute_weather_tool(tool_name, tool_args, dfx, weather_tool_context, forecast_context)
+        except Exception as exc:
+            return {"error": str(exc)}
+
     def _call_openai(messages, max_tokens=700, temperature=0.2):
         """Call OpenAI with fallback models"""
         for model in OPENAI_MODELS_TRY:
@@ -1383,45 +1104,108 @@ with tab_ai:
                 last_err = e
                 continue
         raise RuntimeError(f"All models failed. Last error: {last_err}")
-    
-    # Build JSON snapshot
-    def build_json_snapshot():
-        """Build comprehensive JSON for AI analysis"""
-        summary_data = {
-            "meta": {
-                "station": STATION_ID,
+
+    def _sanitize_history(msgs):
+        safe = []
+        for m in msgs:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if content is None:
+                continue
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, default=json_default)
+                except Exception:
+                    content = str(content)
+            if content.strip() == "":
+                continue
+            safe.append({"role": role, "content": content})
+        return safe
+
+
+    def build_weather_ai_payload() -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "view": {
+                "station": station_label,
                 "date_range": {"start": str(start), "end": str(end)},
+                "records": int(len(dfx)),
                 "growth_stage": growth_stage,
-                "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-            },
-            "summary": {
-                "total_precip_mm": float(dfx[COL_PCP].sum()),
-                "total_eto_mm": float(dfx["ETo (mm)"].sum()) if "ETo (mm)" in dfx.columns else 0,
-                "avg_temp_max": float(dfx[COL_TMAX].mean()),
-                "avg_temp_min": float(dfx[COL_TMIN].mean()),
-                "gdd_accumulated": float(dfx[COL_GDD_FP_CUM].iloc[-1]) if COL_GDD_FP_CUM in dfx.columns and len(dfx) > 0 else 0
-            },
-            # "irrigation_decision": decision,
-            # "alerts": [{"type": a["type"], "title": a["title"], "message": a["message"], "action": a["action"]} 
-            #           for a in alerts[:5]],
-            "forecast_summary": {
-                "city": city_used,
-                "next_24h_temp_range": [float(dff["Temp_Min"].head(8).min()), float(dff["Temp_Max"].head(8).max())] if not dff.empty else [],
-                "next_24h_rain_mm": float(dff["Rain_3h"].head(8).sum()) if not dff.empty else 0
+                "gdd_target": gdd_target if gdd_target > 0 else None,
+                "selected_variables": plot_vars,
             }
         }
-        return summary_data
-    
-    json_snapshot = build_json_snapshot()
+        weather_summary = summarize_weather_period(dfx, COL_DATE, COL_PCP, COL_TMAX, COL_TMIN, "ETo (mm)")
+        if weather_summary:
+            payload["weather_summary"] = weather_summary
+
+        if COL_GDD_FP_CUM in dfa.columns and not dfa.empty:
+            payload["gdd_status"] = weather_tools.get_gdd_status(
+                dfa,
+                date_col=COL_DATE,
+                gdd_col=COL_GDD_FP_CUM,
+                planting_date=planting_date,
+                target=gdd_target if gdd_target > 0 else None,
+            )
+
+        if "ETo (mm)" in dfx.columns:
+            payload["eto_summary"] = weather_tools.get_eto_for_period(
+                dfx,
+                COL_DATE,
+                "ETo (mm)",
+                start=str(start),
+                end=str(end),
+            )
+
+        if COL_PCP in dfx.columns:
+            rain_events = (
+                dfx[[COL_DATE, COL_PCP]]
+                .sort_values(COL_PCP, ascending=False)
+                .head(5)
+                .assign(date=lambda d: d[COL_DATE].dt.strftime("%Y-%m-%d"))
+            )
+            payload["rainfall_summary"] = {
+                "total_mm": float(dfx[COL_PCP].sum()),
+                "avg_daily_mm": float(dfx[COL_PCP].mean()),
+                "heaviest_events": [
+                    {"date": row["date"], "rain_mm": float(row[COL_PCP])}
+                    for _, row in rain_events.iterrows()
+                ],
+            }
+
+        irrigation_summary = dict(decision)
+        irrigation_summary["recent_window_days"] = 7
+        irrigation_summary["cost_per_inch"] = irrigation_cost_per_inch
+        payload["irrigation_recommendation"] = irrigation_summary
+
+        balance_df = compute_water_balance(dfx, COL_DATE, COL_PCP, "ETo (mm)")
+        if not balance_df.empty:
+            payload["water_balance"] = {
+                "latest_date": str(balance_df[COL_DATE].iloc[-1].date()),
+                "balance_mm": float(balance_df["Balance"].iloc[-1]),
+            }
+
+        payload["forecast"] = {
+            "city": city_used,
+            "summary": weather_tools.get_forecast_summary(forecast_context),
+        }
+        payload["alerts"] = weather_tools.get_smart_alerts(forecast_context).get("alerts", [])
+        payload["simulation"] = {
+            "planned_irrigation_in": simulated_irrigation_in,
+            "weather_adjustments": {"temp_shift": sim_temp, "humidity_shift": sim_rh},
+        }
+        payload["tools_available"] = [tool["function"]["name"] for tool in weather_tools.WEATHER_TOOL_DEFINITIONS]
+        return payload
+
+    json_payload = build_weather_ai_payload()
     
     # Display JSON
     st.markdown("### 📄 Data Snapshot")
-    st.markdown('<p class="help-text">Compact JSON summary of weather data, ET, GDD, irrigation decision, and forecast for AI analysis</p>', unsafe_allow_html=True)
+    st.markdown('<p class="help-text">Structured summary covering GDD, ET, rainfall, irrigation guidance, and forecast context.</p>', unsafe_allow_html=True)
     
     with st.expander("View JSON Snapshot"):
-        st.json(json_snapshot)
+        st.json(json_payload)
     
-    json_str = json.dumps(json_snapshot, indent=2, default=_json_default)
+    json_str = json.dumps(json_payload, indent=2, default=json_default)
     st.download_button("⬇️ Download JSON", json_str.encode("utf-8"),
                       file_name=f"weather_snapshot_{start}_{end}.json",
                       mime="application/json")
@@ -1475,19 +1259,80 @@ with tab_ai:
         
         try:
             use_data = (mode == "Data-only") or (mode == "Auto" and is_data_question(prompt))
-            
+            history = _sanitize_history(st.session_state.ai_chat[:-1])
+            messages = []
             if use_data:
-                messages = [
-                    {"role": "system", "content": "Answer using the provided weather data JSON. Be concise and include units."},
-                    {"role": "user", "content": f"Data:\n{json_str}\n\nQuestion: {prompt}"}
-                ]
+                system_prompt = (
+                    "You are an agricultural weather analyst. Use the provided data snapshot and tools when needed. "
+                    "Cite key numbers with units."
+                )
+                messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": f"Weather data snapshot:\n{json_str}"})
             else:
-                messages = [
-                    {"role": "system", "content": "You are a helpful agricultural advisor."},
-                    {"role": "user", "content": prompt}
-                ]
+                messages.append({"role": "system", "content": "You are a helpful agricultural advisor."})
+            messages.extend(history)
+            messages.append({"role": "user", "content": prompt})
             
-            answer = _call_openai(messages, max_tokens=500, temperature=0.3)
+            with st.spinner("Generating answer..."):
+                if use_data:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages,
+                        tools=tool_definitions,
+                        tool_choice="auto",
+                        max_tokens=700,
+                        temperature=0.2,
+                    )
+                    iteration = 0
+                    while response.choices[0].finish_reason == "tool_calls" and iteration < 5:
+                        iteration += 1
+                        assistant_msg = response.choices[0].message
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": assistant_msg.content or "",
+                                "tool_calls": [
+                                    {
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments,
+                                        },
+                                    }
+                                    for tc in (assistant_msg.tool_calls or [])
+                                ],
+                            }
+                        )
+                        for tool_call in assistant_msg.tool_calls or []:
+                            try:
+                                args = json.loads(tool_call.function.arguments)
+                            except Exception:
+                                args = {}
+                            tool_response = execute_tool_call(tool_call.function.name, args)
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": json.dumps(tool_response, default=json_default),
+                                }
+                            )
+                        response = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=messages,
+                            tools=tool_definitions,
+                            tool_choice="auto",
+                            max_tokens=700,
+                            temperature=0.2,
+                        )
+                else:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages,
+                        max_tokens=600,
+                        temperature=0.4,
+                    )
+            answer = response.choices[0].message.content or "(no response)"
             st.session_state.ai_chat.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
         except Exception as e:

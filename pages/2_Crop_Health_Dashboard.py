@@ -7,33 +7,46 @@
 from __future__ import annotations
 
 import os
-from glob import glob
 from datetime import datetime
 import random
-import re
-from io import BytesIO
 import json
+from io import BytesIO
+from typing import Any, Dict, Optional, Union
+import textwrap
 
-import streamlit as st
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import rasterio
 from rasterio.transform import array_bounds
-from rasterio.warp import reproject, Resampling, calculate_default_transform
-from rasterstats import zonal_stats
+from rasterio.warp import Resampling, calculate_default_transform, reproject
 
 import folium
 from folium.features import GeoJson, GeoJsonTooltip
-from streamlit_folium import st_folium
 import plotly.graph_objects as go
+import streamlit as st
+from streamlit_folium import st_folium
 
 # Import AI tools (your companion module with function implementations)
 import ai_tools
-import pandas as pd
-import numpy as np
-from datetime import date as _date
-from typing import Optional, Union, Dict, Any
+
+from src.data_loader import (
+    build_image_catalog,
+    build_image_catalog_from_archive,
+    calculate_all_zonal_stats,
+    load_ghg_data,
+    load_management_n,
+    read_plots,
+)
+from src.utils import (
+    center_from_bounds,
+    colorize_ryg,
+    compute_treatment_percentile,
+    index_dates_for,
+    json_default,
+    safe_percent,
+    value_to_css,
+)
 
 # ============================================================
 # PAGE CONFIG & THEME
@@ -83,16 +96,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-DEFAULT_IMAGE_DIR = "Files/Index"
-DEFAULT_SHP_PATH = "Files/2024_Colby_TAPS_Harvest_Area.shp"
-DEFAULT_MGMT_XLSX = "Files/Nitrogen_24.xlsx"
-DEFAULT_MGMT_N_SHEET = "Sheet1"
-GHG_FILE_PATH = "Files/GHG_2024.xlsx"
-
-
 # --- OpenAI client init (secure) ---
 OPENAI_API_KEY = st.secrets["open_ai_key"]
 
@@ -114,385 +117,43 @@ MCARI_MIN, MCARI_MAX = 0.0, 1.0
 # Stress thresholds
 DEFAULT_NDVI_STRESS = 0.5
 DEFAULT_MCARI_STRESS = 0.3
+st.sidebar.header("⚙️ Dashboard Controls")
+st.sidebar.markdown('<p class="small-muted">Work with the bundled 2024 dataset or upload your own imagery and boundaries.</p>', unsafe_allow_html=True)
 
-
-# ============================================================
-# HELPERS (cached)
-# ============================================================
-
-@st.cache_data(show_spinner=False)
-def list_tifs(directory: str):
-    if not os.path.isdir(directory):
-        return []
-    return sorted(glob(os.path.join(directory, "*.tif")))
-
-FNAME_RE = re.compile(r"^(?P<index>[A-Za-z0-9]+)_(?P<date>\d{4}-\d{2}-\d{2})\.tif$", re.IGNORECASE)
-
-@st.cache_data(show_spinner=False)
-def build_image_catalog(directory: str):
-    """Build {index: {date: path}} from TIFFs"""
-    catalog = {}
-    for p in list_tifs(directory):
-        fn = os.path.basename(p)
-        m = FNAME_RE.match(fn)
-        if m:
-            ix = m.group("index").upper()
-            date_str = m.group("date")
-            try:
-                dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except Exception:
-                continue
-        else:
-            try:
-                ix, date_str = fn.split("_", 1)
-                ix = ix.upper()
-                dt = datetime.strptime(os.path.splitext(date_str)[0], "%Y-%m-%d").date()
-            except Exception:
-                continue
-        catalog.setdefault(ix, {})[dt] = p
-    for k in list(catalog.keys()):
-        catalog[k] = dict(sorted(catalog[k].items(), key=lambda kv: kv[0]))
-    return catalog
-
-
-@st.cache_data(show_spinner=False)
-def load_management_n(xlsx_path: str, sheet: str) -> pd.DataFrame:
-    """Parse nitrogen schedule"""
-    try:
-        df = pd.read_excel(xlsx_path, sheet_name=sheet)
-    except Exception:
-        return pd.DataFrame(columns=["TRT_ID", "Date", "Amount"])
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    if "TRT_ID" not in df.columns:
-        return pd.DataFrame(columns=["TRT_ID", "Date", "Amount"])
-
-    planting_date_col = None
-    planting_amt_col = None
-    date_like_cols = []
-    date_hdr_re = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
-
-    for c in df.columns:
-        lc = c.lower()
-        if lc == "trt_id":
-            continue
-        if "planting date amount" in lc:
-            planting_amt_col = c
-        elif "planting date" in lc:
-            planting_date_col = c
-        elif "lbs" in lc:
-            continue
-        elif date_hdr_re.match(c):
-            date_like_cols.append(c)
-
-    def _clean_num(x):
-        if pd.isna(x):
-            return np.nan
-        if isinstance(x, (int, float, np.number)):
-            return float(x)
-        s = re.sub(r"[^0-9.\-]", "", str(x))
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
-
-    if date_like_cols:
-        df_dates = df.melt(id_vars=["TRT_ID"], value_vars=date_like_cols,
-                           var_name="Date", value_name="Amount")
-        df_dates["Amount"] = df_dates["Amount"].map(_clean_num)
-        df_dates["Date"] = pd.to_datetime(df_dates["Date"], format="%m/%d/%y", errors="coerce")
+with st.sidebar.expander("📂 Data Inputs", expanded=True):
+    data_mode = st.radio("Data source", ["Sample dataset", "Upload files"], index=0)
+    management_sheet = st.text_input("Nitrogen sheet name", value="Sheet1")
+    if data_mode == "Upload files":
+        imagery_archive = st.file_uploader("Imagery (ZIP of GeoTIFF tiles)", type=["zip"])
+        shapefile_archive = st.file_uploader("Plot boundaries (Shapefile ZIP)", type=["zip"])
+        management_file = st.file_uploader("Nitrogen schedule (Excel)", type=["xlsx", "xls"])
+        ghg_file = st.file_uploader("GHG flux (Excel, optional)", type=["xlsx", "xls"])
     else:
-        df_dates = pd.DataFrame(columns=["TRT_ID", "Date", "Amount"])
+        imagery_archive = None
+        shapefile_archive = None
+        management_file = "Files/Nitrogen_24.xlsx"
+        ghg_file = "Files/GHG_2024.xlsx"
 
-    if planting_date_col and planting_amt_col:
-        df_plant = df[["TRT_ID", planting_date_col, planting_amt_col]].rename(
-            columns={planting_date_col: "Date", planting_amt_col: "Amount"}
-        )
-        df_plant["Date"] = pd.to_datetime(df_plant["Date"], errors="coerce")
-        df_plant["Amount"] = df_plant["Amount"].map(_clean_num)
-    else:
-        df_plant = pd.DataFrame(columns=["TRT_ID", "Date", "Amount"])
-
-    out = pd.concat([df_dates, df_plant], ignore_index=True)
-    out = out.dropna(subset=["Date", "Amount"])
-    out["TRT_ID"] = out["TRT_ID"].astype(str)
-    out["Date"] = out["Date"].dt.date
-    out = out.groupby(["TRT_ID", "Date"], as_index=False)["Amount"].sum()
-    return out
-
-
-@st.cache_data(show_spinner=False)
-def load_ghg_data(file_path: str):
-    """Load GHG data (TRT_ID x Date -> N2O_Flux)"""
-    if not os.path.exists(file_path):
-        return pd.DataFrame()
-    try:
-        df = pd.read_excel(file_path)
-        df['TRT_ID'] = df['TRT_ID'].ffill()
-        id_vars = ['TRT_ID', 'Plot']
-        date_cols = [col for col in df.columns if col not in id_vars]
-        df_long = pd.melt(df, id_vars=id_vars, value_vars=date_cols,
-                          var_name='Date', value_name='N2O_Flux')
-        df_long['Date'] = pd.to_datetime(df_long['Date'], errors='coerce', dayfirst=True)
-        df_long.dropna(subset=['Date', 'N2O_Flux'], inplace=True)
-        df_long['TRT_ID'] = df_long['TRT_ID'].astype(str).str.replace('T', '', regex=False)
-        df_long['Date'] = df_long['Date'].dt.date
-        return df_long
-    except Exception:
-        return pd.DataFrame()
-
-
-@st.cache_data(show_spinner=False)
-def read_plots(shp_path: str) -> gpd.GeoDataFrame:
-    gdf = gpd.read_file(shp_path)
-    if "Plot_ID" not in gdf.columns:
-        cand = [c for c in gdf.columns if c.lower() in ("plot_id", "plotid", "plot", "name", "id")]
-        gdf["Plot_ID"] = gdf[cand[0]] if cand else np.arange(len(gdf)).astype(str)
-    if "TRT_ID" not in gdf.columns:
-        gdf["TRT_ID"] = "N/A"
-    gdf["Plot_ID"] = gdf["Plot_ID"].astype(str)
-    gdf["TRT_ID"] = gdf["TRT_ID"].astype(str)
-    return gdf
-
-
-def value_to_css(v, vmin, vmax):
-    if v is None or (isinstance(v, float) and not np.isfinite(v)):
-        return "rgba(0,0,0,0)"
-    t = (float(v) - vmin) / (vmax - vmin + 1e-9)
-    t = float(np.clip(t, 0.0, 1.0))
-    if t < 0.5:
-        r = 255
-        g = int(2.0 * t * 255)
-    else:
-        r = int((1.0 - 2.0 * (t - 0.5)) * 255)
-        g = 255
-    return f"rgba({r},{g},0,0.9)"
-
-
-@st.cache_data(show_spinner="📊 Calculating zonal statistics...")
-def calculate_all_zonal_stats(catalog: dict, _plots_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
-    """Pre-calculate zonal statistics (mean) for ALL indices × dates × plots."""
-    all_stats = []
-    for index_name, date_dict in catalog.items():
-        for date_val, img_path in date_dict.items():
-            try:
-                with rasterio.open(img_path) as src:
-                    arr = src.read(1).astype("float32")
-                    arr[~np.isfinite(arr)] = np.nan
-
-                    plots_native = _plots_gdf.to_crs(src.crs)
-                    zs = zonal_stats(
-                        plots_native,
-                        arr,
-                        affine=src.transform,
-                        stats=["mean"],
-                        nodata=np.nan,
-                        all_touched=False,
-                    )
-
-                    for idx, stat_dict in enumerate(zs):
-                        all_stats.append({
-                            'Plot_ID': _plots_gdf.iloc[idx]['Plot_ID'],
-                            'TRT_ID': _plots_gdf.iloc[idx]['TRT_ID'],
-                            'Index': index_name,
-                            'Date': date_val,
-                            'Mean': stat_dict.get('mean', np.nan)
-                        })
-            except Exception as e:
-                st.warning(f"Error processing {index_name} on {date_val}: {e}")
-                continue
-
-    if not all_stats:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_stats)
-    df['Plot_ID'] = df['Plot_ID'].astype(str)
-    df['TRT_ID'] = df['TRT_ID'].astype(str)
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
-    return df
-
-def _coerce_date(d) -> Optional[_date]:
-    if d is None or pd.isna(d):
-        return None
-    if isinstance(d, _date):
-        return d
-    try:
-        return pd.to_datetime(d, errors="coerce").date()
-    except Exception:
-        return None
-
-def calculate_treatment_percentile(
-    master_zonal_stats: pd.DataFrame,
-    index_name: str,
-    date: Optional[Union[str, _date]] = None,
-    metric: str = "mean",              # "mean" | "median" | "max"
-    trt_id: Optional[str] = None,
-    higher_is_better: bool = True,     # True: higher index ⇒ better percentile
-    decimals: int = 3
-) -> Dict[str, Any]:
-    """
-    Compute per-treatment performance for a given index (optionally on a specific date)
-    and the percentile of a chosen treatment.
-
-    Returns:
-      {
-        "index_name": str,
-        "date": date_used or None,
-        "metric": str,
-        "n_treatments": int,
-        "table": [ { "TRT_ID": str, "value": float, "rank": int, "percentile": float }, ... ],
-        # present only if trt_id provided:
-        "trt_id": str,
-        "value": float,
-        "rank": int,
-        "percentile": float
-      }
-    """
-    if master_zonal_stats is None or master_zonal_stats.empty:
-        return {"error": "master_zonal_stats is empty."}
-
-    idx = str(index_name).upper()
-    df = master_zonal_stats[master_zonal_stats["Index"].str.upper() == idx].copy()
-    if df.empty:
-        return {"error": f"No records for index '{index_name}'."}
-
-    # pick date (default: latest available for this index)
-    date_used = _coerce_date(date)
-    if date_used is None:
-        # ensure Date is date dtype
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-        avail = df["Date"].dropna().unique()
-        if len(avail) == 0:
-            return {"error": f"No valid dates found for index '{index_name}'."}
-        date_used = sorted(avail)[-1]
-    else:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-
-    df = df[df["Date"] == date_used]
-    if df.empty:
-        return {"error": f"No data for index '{index_name}' on {date_used}."}
-
-    # aggregate by treatment
-    agg_map = {
-        "mean": lambda s: float(np.nanmean(s.values)) if len(s) else np.nan,
-        "median": lambda s: float(np.nanmedian(s.values)) if len(s) else np.nan,
-        "max": lambda s: float(np.nanmax(s.values)) if len(s) else np.nan,
-    }
-    if metric not in agg_map:
-        return {"error": f"Unsupported metric '{metric}'. Use one of: mean, median, max."}
-
-    g = (df.groupby("TRT_ID", as_index=False)["Mean"]
-            .apply(agg_map[metric])
-            .rename(columns={"Mean": "value"}))
-    g["TRT_ID"] = g["TRT_ID"].astype(str)
-
-    # drop NaN values (no valid plots for that TRT at that date)
-    g = g[np.isfinite(g["value"])].copy()
-    if g.empty:
-        return {"error": "No finite treatment values to rank."}
-
-    # ranking & percentile (0–100). If higher_is_better=False, invert with ascending=True.
-    # rank: 1 = best
-    g["rank"] = g["value"].rank(ascending=not higher_is_better, method="min").astype(int)
-    g["percentile"] = (g["value"].rank(pct=True, ascending=not higher_is_better) * 100.0)
-    g["percentile"] = g["percentile"].round(1)
-    g["value"] = g["value"].round(decimals)
-
-    # sort for readability
-    g = g.sort_values("value", ascending=not higher_is_better).reset_index(drop=True)
-    n_treatments = int(len(g))
-
-    result: Dict[str, Any] = {
-        "index_name": idx,
-        "date": date_used,
-        "metric": metric,
-        "n_treatments": n_treatments,
-        "table": g.to_dict(orient="records"),
-    }
-
-    if trt_id is not None:
-        trt_str = str(trt_id)
-        row = g[g["TRT_ID"] == trt_str]
-        if row.empty:
-            return {
-                **result,
-                "warning": f"Treatment '{trt_str}' not present on {date_used}.",
-            }
-        row = row.iloc[0]
-        result.update({
-            "trt_id": trt_str,
-            "value": float(row["value"]),
-            "rank": int(row["rank"]),
-            "percentile": float(row["percentile"]),
-        })
-
-    return result
-
-
-
-def _json_default(o):
-    import numpy as _np
-    import pandas as _pd
-    import datetime as _dt
-    if isinstance(o, (_np.integer,)): return int(o)
-    if isinstance(o, (_np.floating,)): return float(o)
-    if isinstance(o, (_np.bool_,)): return bool(o)
-    if isinstance(o, (_pd.Timestamp, _dt.datetime, _dt.date)): return o.isoformat()
-    if o is _pd.NaT: return None
-    return str(o)
-
-
-def _safe_div(num, den, default=0.0):
-    try:
-        if den and np.isfinite(den) and float(den) != 0.0:
-            return float(num) / float(den)
-    except Exception:
-        pass
-    return default
-
-
-def _safe_pct(num, den) -> float:
-    return round(_safe_div(num, den, 0.0) * 100.0, 1)
-
-
-def _index_dates_for(idx_name: str) -> list[datetime.date]:
-    """Return a sorted list of valid dates for an index (safe for selectboxes)."""
-    ds = master_zonal_stats[master_zonal_stats['Index'] == idx_name]['Date'].unique()
-    ds = pd.to_datetime(ds, errors="coerce")
-    ds = ds.dropna()
-    return sorted(d.date() for d in ds)
-
-
-def colorize_ryg(a, vmin, vmax, alpha=220):
-    a = a.astype("float32", copy=False)
-    mask = ~np.isfinite(a)
-    t = (a - vmin) / (vmax - vmin + 1e-9)
-    t = np.clip(t, 0.0, 1.0)
-    r = np.where(t < 0.5, 255.0, (1.0 - 2.0 * (t - 0.5)) * 255.0)
-    g = np.where(t < 0.5, (2.0 * t) * 255.0, 255.0)
-    b = np.zeros_like(r)
-    r = np.clip(r, 0, 255).astype(np.uint8)
-    g = np.clip(g, 0, 255).astype(np.uint8)
-    b = b.astype(np.uint8)
-    a8 = np.where(mask, 0, alpha).astype(np.uint8)
-    return np.dstack([r, g, b, a8])
+if data_mode == "Upload files" and (imagery_archive is None or shapefile_archive is None):
+    st.sidebar.warning("Upload imagery and shapefile archives or switch to the sample dataset.")
+    st.stop()
 
 
 # ============================================================
 # DATA PATHS & LOADS
 # ============================================================
-image_dir = DEFAULT_IMAGE_DIR
-shp_path = DEFAULT_SHP_PATH
-mgmt_xlsx = DEFAULT_MGMT_XLSX
-mgmt_sheet = DEFAULT_MGMT_N_SHEET
+if data_mode == "Sample dataset":
+    catalog = build_image_catalog("Files/Index")
+    shapefile_source = "Files/2024_Colby_TAPS_Harvest_Area.shp"
+else:
+    catalog = build_image_catalog_from_archive(imagery_archive)
+    shapefile_source = shapefile_archive
 
-catalog = build_image_catalog(image_dir)
 if not catalog:
-    st.error("❌ No .tif files found. Expected format: NDVI_YYYY-MM-DD.tif")
+    st.error("❌ No imagery found. Ensure GeoTIFFs follow the NDVI_YYYY-MM-DD.tif naming pattern.")
     st.stop()
 
-plots = read_plots(shp_path)
+plots = read_plots(shapefile_source)
 plot_to_trt = dict(zip(plots["Plot_ID"], plots["TRT_ID"]))
 
 master_zonal_stats = calculate_all_zonal_stats(catalog, plots)
@@ -501,12 +162,18 @@ master_zonal_stats = calculate_all_zonal_stats(catalog, plots)
 if not master_zonal_stats.empty:
     master_zonal_stats['Date'] = pd.to_datetime(master_zonal_stats['Date']).dt.date
 
-N_df = load_management_n(mgmt_xlsx, mgmt_sheet)
+if management_file:
+    try:
+        N_df = load_management_n(management_file, management_sheet)
+    except Exception:
+        N_df = pd.DataFrame(columns=["TRT_ID", "Date", "Amount"])
+else:
+    N_df = pd.DataFrame(columns=["TRT_ID", "Date", "Amount"])
 if not N_df.empty:
     N_df = N_df.groupby(["TRT_ID", "Date"], as_index=False)["Amount"].sum()
     N_df['Date'] = pd.to_datetime(N_df['Date']).dt.date
 
-ghg_df = load_ghg_data(GHG_FILE_PATH)
+ghg_df = load_ghg_data(ghg_file) if ghg_file else pd.DataFrame()
 if not ghg_df.empty:
     ghg_df['Date'] = pd.to_datetime(ghg_df['Date']).dt.date
 
@@ -514,11 +181,6 @@ if not ghg_df.empty:
 rng = random.Random(42)
 trt_colors = {trt: f"#{rng.randrange(0x100000, 0xFFFFFF):06x}" for trt in plots["TRT_ID"].unique()}
 
-
-# ============================================================
-# SIDEBAR CONTROLS
-# ============================================================
-st.sidebar.header("⚙️ Dashboard Controls")
 
 st.sidebar.markdown("### Map Options")
 index_name = st.sidebar.radio("Index:", sorted(catalog.keys()), horizontal=True).upper()
@@ -618,7 +280,7 @@ if not current_stats.empty:
         st.metric(
             "🚨 Stressed Plots",
             f"{stressed_count}/{total_now}",
-            delta=f"{_safe_pct(stressed_count, total_now):.1f}%",
+            delta=f"{safe_percent(stressed_count, total_now):.1f}%",
             delta_color="inverse"
         )
         if stressed_count > 0:
@@ -979,6 +641,79 @@ else:
     if "ai_messages" not in st.session_state:
         st.session_state.ai_messages = []
 
+    @st.cache_data(show_spinner=False)
+    def build_ai_context(index_name: str, sel_date, current_stats, master_zonal_stats, _plots):
+        threshold = stress_threshold
+        context: Dict[str, Any] = {
+            "selection": {
+                "index": index_name,
+                "date": str(sel_date),
+                "plots_total": int(len(plots)),
+                "plots_visible": int(len(current_stats)),
+                "treatments": sorted(plots["TRT_ID"].unique()),
+                "stress_threshold": float(threshold),
+            }
+        }
+        if not current_stats.empty:
+            stats = current_stats["Mean"].describe(percentiles=[0.25, 0.5, 0.75])
+            context["index_stats"] = {
+                "mean": float(stats["mean"]),
+                "min": float(stats["min"]),
+                "max": float(stats["max"]),
+                "std": float(stats["std"]),
+                "pct25": float(stats["25%"]),
+                "pct50": float(stats["50%"]),
+                "pct75": float(stats["75%"]),
+            }
+            stressed_df = current_stats[current_stats["Mean"] < threshold]
+            context["stress_summary"] = {
+                "count": int(len(stressed_df)),
+                "percent": safe_percent(len(stressed_df), len(current_stats)),
+                "top_stressed": [
+                    {"plot_id": row["Plot_ID"], "trt_id": row["TRT_ID"], "value": float(row["Mean"])}
+                    for _, row in stressed_df.nsmallest(5, "Mean").iterrows()
+                ],
+            }
+            trt_means = current_stats.groupby("TRT_ID")["Mean"].mean().sort_values(ascending=False)
+            context["treatment_aggregates"] = {
+                "top": [{"trt_id": trt, "value": float(val)} for trt, val in trt_means.head(5).items()],
+                "bottom": [{"trt_id": trt, "value": float(val)} for trt, val in trt_means.tail(5).items()],
+            }
+        idx_df = master_zonal_stats[master_zonal_stats["Index"] == index_name].copy()
+        if not idx_df.empty:
+            idx_df = idx_df.sort_values("Date")
+            unique_dates = sorted(idx_df["Date"].unique())
+            if len(unique_dates) >= 2:
+                latest = unique_dates[-1]
+                prev = unique_dates[-2]
+                latest_val = float(idx_df[idx_df["Date"] == latest]["Mean"].mean())
+                prev_val = float(idx_df[idx_df["Date"] == prev]["Mean"].mean())
+                context["trend"] = {
+                    "latest_date": str(latest),
+                    "previous_date": str(prev),
+                    "delta": latest_val - prev_val,
+                    "percent_change": safe_percent(latest_val - prev_val, prev_val) if prev_val else None,
+                }
+        if not N_df.empty:
+            recent_n = N_df.sort_values("Date").tail(5)
+            context["nitrogen_events"] = [
+                {"trt_id": row["TRT_ID"], "date": str(row["Date"]), "amount": float(row["Amount"])}
+                for _, row in recent_n.iterrows()
+            ]
+        if not ghg_df.empty:
+            recent_flux = ghg_df.sort_values("Date").tail(5)
+            context["ghg_flux_events"] = [
+                {"trt_id": row["TRT_ID"], "date": str(row["Date"]), "flux": float(row["N2O_Flux"])}
+                for _, row in recent_flux.iterrows()
+            ]
+        return context
+
+    ai_context = build_ai_context(index_name, sel_date, current_stats, master_zonal_stats, plots)
+    context_json = json.dumps(ai_context, indent=2, default=json_default)
+
+    with st.expander("📄 AI Context Snapshot", expanded=False):
+        st.json(ai_context)
+
     # Display history
     for msg in st.session_state.ai_messages:
         with st.chat_message(msg["role"]):
@@ -992,23 +727,13 @@ else:
         # -----------------------------
         # Build system prompt + messages
         # -----------------------------
-        system_message = f"""You are an expert agronomist analyzing crop health data from a precision agriculture trial.
-
-Current Context:
-- Date: {sel_date}
-- Index: {index_name}
-- Total Plots: {len(plots)}
-- Treatments: {', '.join(sorted(plots['TRT_ID'].unique()))}
-- Available Data: NDVI, MCARI2, Nitrogen applications, Water needs, N2O emissions
-- Date Range: {master_zonal_stats['Date'].min()} to {master_zonal_stats['Date'].max()}
-
-When answering questions:
-1. Use the available tools to query specific data
-2. Provide actionable insights and recommendations
-3. Cite specific numbers and plot/treatment IDs
-4. Be concise but thorough
-5. If data is missing, say so clearly
-"""
+        system_message = textwrap.dedent(
+            f"""
+            You are an expert agronomist analyzing crop health data from a precision agriculture trial.
+            Use the JSON context and available tools to answer questions with precise references.
+            Cite plot/treatment IDs and include numeric values with units when possible.
+            """
+        ).strip()
 
         def _sanitize_history(msgs):
             safe = []
@@ -1019,7 +744,7 @@ When answering questions:
                     continue
                 if not isinstance(content, str):
                     try:
-                        content = json.dumps(content, default=_json_default)
+                        content = json.dumps(content, default=json_default)
                     except Exception:
                         content = str(content)
                 if content.strip() == "":
@@ -1028,7 +753,11 @@ When answering questions:
             return safe
 
         history = _sanitize_history(st.session_state.ai_messages)
-        messages = [{"role": "system", "content": system_message}, *history]
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Context JSON:\n{context_json}"},
+            *history,
+        ]
 #
         # ---------------
         # Chat completion
@@ -1080,7 +809,7 @@ When answering questions:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": json.dumps(tool_result, default=_json_default)
+                            "content": json.dumps(tool_result, default=json_default)
                         })
 
                     # Next turn after tools
@@ -1135,7 +864,7 @@ with st.expander("📊 SQL-Style Query Builder", expanded=False):
 
     with query_col3:
         query_date_option = st.radio("Date filter:", ["Latest", "Specific", "Date range"])
-        available_dates = _index_dates_for(query_index)
+        available_dates = index_dates_for(master_zonal_stats, query_index)
         if query_date_option == "Specific":
             if available_dates:
                 query_date = st.selectbox("Select date:", available_dates, index=len(available_dates) - 1)
@@ -1213,19 +942,7 @@ else:
     tiles = "Stamen Terrain"
     attr = None
 
-def _center_from_bounds(bounds, gdf_fallback):
-    """Return (lat, lon) center from [L, B, R, T] or fallback to gdf bounds."""
-    try:
-        L, B, R, T = bounds
-        if np.all(np.isfinite([L, B, R, T])):
-            return ((T + B) / 2.0, (L + R) / 2.0)
-    except Exception:
-        pass
-    # Fallback: center of vector layer bounds
-    minx, miny, maxx, maxy = gdf_fallback.geometry.total_bounds
-    return ((miny + maxy) / 2.0, (minx + maxx) / 2.0)
-
-center_lat, center_lon = _center_from_bounds((L2, B2, R2, T2), plots_w84)
+center_lat, center_lon = center_from_bounds((L2, B2, R2, T2), plots_w84)
 
 # Fallback to polygon bounds if NaN
 if not np.isfinite(center_lat) or not np.isfinite(center_lon):
@@ -1453,7 +1170,7 @@ with st.expander("📌 Uniformity & Hotspots (by date)", expanded=False):
     with colu1:
         uni_index = st.selectbox("Index", ["NDVI", "MCARI2"], index=0, key="uni_idx")
 
-    dates_uni = _index_dates_for(uni_index)
+    dates_uni = index_dates_for(master_zonal_stats, uni_index)
     if not dates_uni:
         st.info(f"No dates available for {uni_index}. Load imagery first.")
     else:
@@ -1508,7 +1225,7 @@ with st.expander("🏅 Treatment Percentile (by date)", expanded=False):
     tp_trt = st.selectbox("Treatment (optional)", trts_all, index=0, key="tp_trt_opt")
 
     if st.button("Compute Percentiles", key="btn_tp"):
-        res = calculate_treatment_percentile(
+        res = compute_treatment_percentile(
             master_zonal_stats,
             index_name=tp_index,
             date=tp_date,
@@ -1537,7 +1254,7 @@ with st.expander("🔄 Change Detection (Δ Between Dates)", expanded=False):
     with cold1:
         d_index = st.selectbox("Index", ["NDVI", "MCARI2"], index=0, key="d_idx")
 
-    dates_available = _index_dates_for(d_index)
+    dates_available = index_dates_for(master_zonal_stats, d_index)
     if len(dates_available) < 2:
         st.info(f"Need at least two dates for {d_index} to compute changes.")
     else:

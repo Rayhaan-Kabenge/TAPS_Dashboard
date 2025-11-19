@@ -1,5 +1,10 @@
-import streamlit as st
+import base64
+from io import BytesIO
 from datetime import datetime
+
+import streamlit as st
+
+from src.assets import KSULOGO_BASE64
 
 # ------------------------------
 # Page config
@@ -93,8 +98,8 @@ p, .markdown-text { line-height:1.45; }
 # ------------------------------
 col_logo, col_title = st.columns([0.14, 1], gap="small")
 with col_logo:
-    # Swap with your actual logo path if different
-    st.image("Files/ksu_logo.png", caption=None, width=520)
+    logo_data = base64.b64decode(KSULOGO_BASE64)
+    st.image(BytesIO(logo_data), caption=None, width=520)
 with col_title:
     st.title("KSUTAPS Decision Support Suite")
     st.markdown("Weather, Crop Health, and Soil insights—unified for faster, better decisions.")
